@@ -34,9 +34,16 @@ const ALLOWED_DIRS = (process.env.ALLOWED_DIRS || process.cwd())
 const sessions = new Map(); // id -> { process, prompt, cwd, startedAt, status }
 
 function isAllowedDir(dir) {
-  const norm = normalize(dir);
-  return ALLOWED_DIRS.some((prefix) => norm.startsWith(prefix));
+  const norm = normalize(dir).replace(/[\\/]$/, "") + "\\";
+  return ALLOWED_DIRS.some((prefix) => {
+    const p = prefix.replace(/[\\/]$/, "") + "\\";
+    return norm === p || norm.startsWith(p);
+  });
 }
+
+const VALID_PERMISSION_MODES = new Set(["bypassPermissions", "acceptEdits", "dontAsk", "default", "plan"]);
+const VALID_SPAWN_MODES = new Set(["same-dir", "worktree", "session"]);
+const NAME_RE = /^[a-zA-Z0-9 _\-]{1,64}$/;
 
 // ---------------------------------------------------------------------------
 // HTTP helpers
@@ -46,10 +53,16 @@ function json(res, status, body) {
   res.end(JSON.stringify(body));
 }
 
+const MAX_BODY = 1024 * 1024; // 1MB
 function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
-    req.on("data", (c) => chunks.push(c));
+    let size = 0;
+    req.on("data", (c) => {
+      size += c.length;
+      if (size > MAX_BODY) { req.destroy(); return reject(new Error("Request body too large")); }
+      chunks.push(c);
+    });
     req.on("end", () => {
       try { resolve(JSON.parse(Buffer.concat(chunks).toString())); }
       catch { reject(new Error("Invalid JSON")); }
@@ -61,77 +74,6 @@ function readBody(req) {
 function auth(req) {
   const h = req.headers.authorization || "";
   return h === `Bearer ${TOKEN}`;
-}
-
-// ---------------------------------------------------------------------------
-// POST /launch  — spawn a claude session
-// Body: { prompt, cwd?, model?, timeout? }
-// Returns: { id, status: "running" }
-// ---------------------------------------------------------------------------
-function handleLaunch(req, res, body) {
-  if (sessions.size >= MAX_SESSIONS) {
-    return json(res, 429, { error: "Too many concurrent sessions", max: MAX_SESSIONS });
-  }
-
-  const { prompt, cwd, model, timeout } = body;
-  if (!prompt) return json(res, 400, { error: "prompt is required" });
-
-  const workDir = cwd ? resolve(cwd) : resolve(ALLOWED_DIRS[0]);
-  if (!isAllowedDir(workDir)) {
-    return json(res, 403, { error: "Working directory not allowed", allowed: ALLOWED_DIRS });
-  }
-
-  const id = randomUUID().slice(0, 8);
-  const args = [
-    "-p", prompt,
-    "--dangerously-skip-permissions",
-    "--output-format", "json",
-  ];
-  if (model) args.push("--model", model);
-
-  const timeoutMs = Math.min((timeout || 300) * 1000, 600_000); // default 5min, max 10min
-
-  const proc = spawn("claude", args, {
-    cwd: workDir,
-    shell: true,
-    env: { ...process.env, FORCE_COLOR: "0" },
-  });
-
-  const session = {
-    id,
-    prompt,
-    cwd: workDir,
-    startedAt: new Date().toISOString(),
-    status: "running",
-    stdout: "",
-    stderr: "",
-    exitCode: null,
-  };
-
-  proc.stdout.on("data", (d) => { session.stdout += d.toString(); });
-  proc.stderr.on("data", (d) => { session.stderr += d.toString(); });
-
-  proc.on("close", (code) => {
-    session.status = code === 0 ? "completed" : "failed";
-    session.exitCode = code;
-  });
-
-  proc.on("error", (err) => {
-    session.status = "error";
-    session.stderr += err.message;
-  });
-
-  // Auto-kill after timeout
-  const timer = setTimeout(() => {
-    if (session.status === "running") {
-      proc.kill("SIGTERM");
-      session.status = "timeout";
-    }
-  }, timeoutMs);
-  proc.on("close", () => clearTimeout(timer));
-
-  sessions.set(id, session);
-  json(res, 202, { id, status: "running", cwd: workDir });
 }
 
 // ---------------------------------------------------------------------------
@@ -187,6 +129,16 @@ function handleRemoteControl(req, res, body) {
 
   const { name, cwd, permissionMode, spawn: spawnMode } = body;
 
+  if (name && !NAME_RE.test(name)) {
+    return json(res, 400, { error: "Invalid name — alphanumeric, spaces, hyphens, underscores only (max 64 chars)" });
+  }
+  if (permissionMode && !VALID_PERMISSION_MODES.has(permissionMode)) {
+    return json(res, 400, { error: "Invalid permissionMode", valid: [...VALID_PERMISSION_MODES] });
+  }
+  if (spawnMode && !VALID_SPAWN_MODES.has(spawnMode)) {
+    return json(res, 400, { error: "Invalid spawn mode", valid: [...VALID_SPAWN_MODES] });
+  }
+
   const workDir = cwd ? resolve(cwd) : resolve(ALLOWED_DIRS[0]);
   if (!isAllowedDir(workDir)) {
     return json(res, 403, { error: "Working directory not allowed", allowed: ALLOWED_DIRS });
@@ -201,7 +153,7 @@ function handleRemoteControl(req, res, body) {
 
   const proc = spawn("claude", args, {
     cwd: workDir,
-    shell: true,
+    shell: false,
     env: { ...process.env, FORCE_COLOR: "0" },
   });
 
@@ -266,62 +218,6 @@ function handleRemoteControl(req, res, body) {
       });
     }
   }, 500);
-}
-
-// ---------------------------------------------------------------------------
-// POST /launch-stream  — spawn and stream stdout as it arrives (SSE)
-// ---------------------------------------------------------------------------
-function handleLaunchStream(req, res, body) {
-  if (sessions.size >= MAX_SESSIONS) {
-    return json(res, 429, { error: "Too many concurrent sessions" });
-  }
-
-  const { prompt, cwd, model, timeout } = body;
-  if (!prompt) return json(res, 400, { error: "prompt is required" });
-
-  const workDir = cwd ? resolve(cwd) : resolve(ALLOWED_DIRS[0]);
-  if (!isAllowedDir(workDir)) {
-    return json(res, 403, { error: "Working directory not allowed" });
-  }
-
-  const args = [
-    "-p", prompt,
-    "--dangerously-skip-permissions",
-    "--output-format", "stream-json",
-  ];
-  if (model) args.push("--model", model);
-
-  const timeoutMs = Math.min((timeout || 300) * 1000, 600_000);
-
-  res.writeHead(200, {
-    "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache",
-    Connection: "keep-alive",
-  });
-
-  const proc = spawn("claude", args, {
-    cwd: workDir,
-    shell: true,
-    env: { ...process.env, FORCE_COLOR: "0" },
-  });
-
-  proc.stdout.on("data", (d) => {
-    res.write(`data: ${d.toString().replace(/\n/g, "\ndata: ")}\n\n`);
-  });
-
-  proc.stderr.on("data", (d) => {
-    res.write(`event: error\ndata: ${d.toString()}\n\n`);
-  });
-
-  proc.on("close", (code) => {
-    res.write(`event: done\ndata: {"exitCode":${code}}\n\n`);
-    res.end();
-  });
-
-  const timer = setTimeout(() => { proc.kill("SIGTERM"); }, timeoutMs);
-  proc.on("close", () => clearTimeout(timer));
-
-  req.on("close", () => { proc.kill("SIGTERM"); clearTimeout(timer); });
 }
 
 // ---------------------------------------------------------------------------
@@ -504,10 +400,7 @@ if (token) renderMain(); else renderTokenSetup();
 // Router
 // ---------------------------------------------------------------------------
 const server = createServer(async (req, res) => {
-  // CORS headers
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
+  // No CORS — UI is same-origin, no cross-origin requests needed
   if (req.method === "OPTIONS") { res.writeHead(204); return res.end(); }
 
   // Health check (no auth)
@@ -526,14 +419,8 @@ const server = createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://localhost:${PORT}`);
 
-    if (req.method === "POST" && url.pathname === "/launch") {
-      return handleLaunch(req, res, await readBody(req));
-    }
     if (req.method === "POST" && url.pathname === "/remote-control") {
       return handleRemoteControl(req, res, await readBody(req));
-    }
-    if (req.method === "POST" && url.pathname === "/launch-stream") {
-      return handleLaunchStream(req, res, await readBody(req));
     }
     if (req.method === "GET" && url.pathname.startsWith("/status/")) {
       return handleStatus(res, url.pathname.split("/")[2]);
@@ -561,16 +448,14 @@ server.listen(PORT, () => {
   console.log(`\nEndpoints:`);
   console.log(`  GET  /               — mobile web UI (no auth)`);
   console.log(`  GET  /projects       — list project directories`);
-  console.log(`  POST /launch         — fire-and-forget, poll /status/:id`);
   console.log(`  POST /remote-control — start remote-control session, returns URL for phone`);
-  console.log(`  POST /launch-stream  — SSE stream of claude output`);
   console.log(`  GET  /status/:id     — get session result`);
   console.log(`  GET  /sessions       — list all sessions`);
   console.log(`  DELETE /session/:id  — kill/remove session`);
   console.log(`  GET  /health         — health check (no auth)`);
 
   // Auto-expose via Tailscale Serve
-  const ts = spawn("tailscale", ["serve", "--bg", String(PORT)], { shell: true });
+  const ts = spawn("tailscale", ["serve", "--bg", String(PORT)], { shell: false });
   ts.stdout.on("data", (d) => console.log(`[tailscale] ${d.toString().trim()}`));
   ts.stderr.on("data", (d) => console.log(`[tailscale] ${d.toString().trim()}`));
   ts.on("close", (code) => {

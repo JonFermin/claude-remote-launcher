@@ -80,8 +80,6 @@ See [SHORTCUT-SETUP.md](SHORTCUT-SETUP.md) for a one-tap shortcut that skips the
 | `GET` | `/health` | Health check (no auth) |
 | `GET` | `/projects` | List project directories |
 | `POST` | `/remote-control` | Start a remote-control session |
-| `POST` | `/launch` | Fire-and-forget Claude session |
-| `POST` | `/launch-stream` | SSE streaming Claude session |
 | `GET` | `/status/:id` | Poll session status |
 | `GET` | `/sessions` | List all sessions |
 | `DELETE` | `/session/:id` | Kill/remove a session |
@@ -100,11 +98,11 @@ Someone would need **both** access to your tailnet **and** your bearer token to 
 
 ### What you should know
 
-- **`bypassPermissions` mode gives Claude full shell access.** A valid request to `/launch` or `/remote-control` with bypass mode can execute arbitrary commands on your machine. This is by design — it's the same as running `claude --dangerously-skip-permissions` locally.
+- **Three layers of security.** An attacker would need access to your Tailscale tailnet, your bearer token, **and** your Claude account login to do anything. The server only spawns `remote-control` sessions — it cannot execute arbitrary prompts headlessly.
 
-- **Don't use Tailscale Funnel.** `tailscale serve` keeps traffic within your tailnet. `tailscale funnel` exposes the server to the public internet — if you do this, the bearer token is the only thing between the internet and your machine.
+- **Don't use Tailscale Funnel.** `tailscale serve` keeps traffic within your tailnet. `tailscale funnel` exposes the server to the public internet — avoid this.
 
-- **The `/launch` endpoint is more dangerous than `/remote-control`.** It passes an arbitrary prompt directly to Claude with no human in the loop. `/remote-control` opens an interactive session where you can see what Claude is doing.
+- **`bypassPermissions` mode gives Claude full shell access.** When selected, Claude can run any command without asking. Use `acceptEdits` or `default` mode for repos you care about.
 
 - **Treat your `.env` like a password.** Anyone with the token and tailnet access has full control.
 
