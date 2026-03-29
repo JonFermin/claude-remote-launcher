@@ -1,7 +1,7 @@
-import { createServer } from "node:http";
-import { spawn } from "node:child_process";
+import { createServer, request as httpRequest } from "node:http";
+import { spawn, execSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { readFileSync, existsSync, readdirSync, statSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, readdirSync, statSync } from "node:fs";
 import { resolve, normalize, basename } from "node:path";
 
 // ---------------------------------------------------------------------------
@@ -29,9 +29,33 @@ const ALLOWED_DIRS = (process.env.ALLOWED_DIRS || process.cwd())
   .map((d) => normalize(d.trim()));
 
 // ---------------------------------------------------------------------------
-// Session tracking
+// Session tracking + persistence
 // ---------------------------------------------------------------------------
 const sessions = new Map(); // id -> { process, prompt, cwd, startedAt, status }
+const STALE_THRESHOLD_MS = 120_000; // 2 minutes without stdout = stale
+const SESSIONS_FILE = new URL("sessions.json", import.meta.url).pathname.replace(/^\/([A-Z]:)/, "$1");
+
+function persistSessions() {
+  const data = [...sessions.values()].map(({ proc, ...rest }) => rest);
+  try { writeFileSync(SESSIONS_FILE, JSON.stringify(data, null, 2)); } catch { /* best effort */ }
+}
+
+function loadSessions() {
+  if (!existsSync(SESSIONS_FILE)) return;
+  try {
+    const data = JSON.parse(readFileSync(SESSIONS_FILE, "utf-8"));
+    for (const s of data) {
+      // Restored sessions have no live process — mark as stopped
+      s.proc = null;
+      if (s.status !== "stopped" && s.status !== "error") s.status = "stopped";
+      s.alive = false;
+      sessions.set(s.id, s);
+    }
+    console.log(`Restored ${data.length} session(s) from disk`);
+  } catch { /* ignore corrupt file */ }
+}
+
+loadSessions();
 
 function isAllowedDir(dir) {
   const norm = normalize(dir).replace(/[\\/]$/, "") + "\\";
@@ -44,6 +68,45 @@ function isAllowedDir(dir) {
 const VALID_PERMISSION_MODES = new Set(["bypassPermissions", "acceptEdits", "dontAsk", "default", "plan"]);
 const VALID_SPAWN_MODES = new Set(["same-dir", "worktree", "session"]);
 const NAME_RE = /^[a-zA-Z0-9 _\-]{1,64}$/;
+
+// ---------------------------------------------------------------------------
+// Liveness helpers
+// ---------------------------------------------------------------------------
+function isProcessAlive(proc) {
+  if (!proc || proc.killed || proc.exitCode !== null) return false;
+  try { proc.kill(0); return true; } catch { return false; }
+}
+
+function checkSessionHealth(session) {
+  if (session.status === "stopped" || session.status === "error") return;
+
+  const alive = isProcessAlive(session.proc);
+  if (!alive) {
+    // Grace period: don't mark brand-new sessions as stopped — the process
+    // may not have fully started yet (especially on Windows).
+    const age = Date.now() - new Date(session.startedAt).getTime();
+    if (session.status === "connecting" && age < 10_000) return;
+
+    session.status = "stopped";
+    session.exitCode = session.proc?.exitCode ?? null;
+    return;
+  }
+
+  // Detect stale: process alive but no stdout activity for a while
+  if (session.status === "ready" && session.lastActivityAt) {
+    const elapsed = Date.now() - new Date(session.lastActivityAt).getTime();
+    if (elapsed > STALE_THRESHOLD_MS) {
+      session.status = "stale";
+    }
+  }
+}
+
+// Periodic health sweep — every 30s
+setInterval(() => {
+  for (const session of sessions.values()) {
+    checkSessionHealth(session);
+  }
+}, 30_000);
 
 // ---------------------------------------------------------------------------
 // HTTP helpers
@@ -83,8 +146,10 @@ function handleStatus(res, id) {
   const s = sessions.get(id);
   if (!s) return json(res, 404, { error: "Session not found" });
 
+  checkSessionHealth(s); // refresh status before responding
+
   const { proc, ...safe } = s; // don't serialize the process object
-  const result = { ...safe };
+  const result = { ...safe, alive: isProcessAlive(s.proc) };
   // Try to parse JSON output from claude
   if (s.type !== "remote-control" && s.status !== "running" && s.stdout) {
     try { result.output = JSON.parse(s.stdout); } catch { /* raw text */ }
@@ -100,10 +165,39 @@ function handleStatus(res, id) {
 // GET /sessions  — list all sessions
 // ---------------------------------------------------------------------------
 function handleList(res) {
-  const list = [...sessions.values()].map(({ id, prompt, permMode, cwd, startedAt, status, exitCode }) => ({
-    id, prompt: prompt.slice(0, 80), permMode, cwd, startedAt, status, exitCode,
-  }));
+  const list = [...sessions.values()].map((s) => {
+    checkSessionHealth(s);
+    return {
+      id: s.id, prompt: s.prompt.slice(0, 80), permMode: s.permMode,
+      cwd: s.cwd.replace(/\\/g, "/"), startedAt: s.startedAt, status: s.status,
+      exitCode: s.exitCode, lastActivityAt: s.lastActivityAt,
+      alive: isProcessAlive(s.proc),
+    };
+  });
   json(res, 200, { sessions: list, count: list.length });
+}
+
+// ---------------------------------------------------------------------------
+// GET /ping/:id  — lightweight liveness check for a session
+// ---------------------------------------------------------------------------
+function handlePing(res, id) {
+  const s = sessions.get(id);
+  if (!s) return json(res, 404, { error: "Session not found" });
+
+  checkSessionHealth(s);
+  const alive = isProcessAlive(s.proc);
+  const elapsed = s.lastActivityAt
+    ? Math.round((Date.now() - new Date(s.lastActivityAt).getTime()) / 1000)
+    : null;
+
+  json(res, 200, {
+    id,
+    status: s.status,
+    alive,
+    lastActivityAt: s.lastActivityAt,
+    silentForSeconds: elapsed,
+    stale: s.status === "stale",
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -114,6 +208,7 @@ function handleDelete(res, id) {
   if (!s) return json(res, 404, { error: "Session not found" });
   if (s.proc) s.proc.kill("SIGTERM");
   sessions.delete(id);
+  persistSessions();
   json(res, 200, { deleted: id });
 }
 
@@ -169,18 +264,26 @@ function handleRemoteControl(req, res, body) {
     stderr: "",
     exitCode: null,
     url: null,
+    lastActivityAt: new Date().toISOString(),
     proc,
   };
 
   proc.stdout.on("data", (d) => {
     const chunk = d.toString();
     session.stdout += chunk;
+    session.lastActivityAt = new Date().toISOString();
+
+    // If session was stale but got new output, it's alive again
+    if (session.status === "stale") {
+      session.status = "ready";
+    }
 
     // Parse the session URL from stdout
     const urlMatch = chunk.match(/https:\/\/claude\.ai\/code\/[^\s\x1b]*/);
     if (urlMatch && !session.url) {
       session.url = urlMatch[0];
       session.status = "ready";
+      persistSessions();
     }
 
     // Also check for "connected" / "ready" signals
@@ -189,19 +292,25 @@ function handleRemoteControl(req, res, body) {
     }
   });
 
-  proc.stderr.on("data", (d) => { session.stderr += d.toString(); });
+  proc.stderr.on("data", (d) => {
+    session.stderr += d.toString();
+    session.lastActivityAt = new Date().toISOString();
+  });
 
   proc.on("close", (code) => {
     session.status = "stopped";
     session.exitCode = code;
+    persistSessions();
   });
 
   proc.on("error", (err) => {
     session.status = "error";
     session.stderr += err.message;
+    persistSessions();
   });
 
   sessions.set(id, session);
+  persistSessions();
 
   // Wait briefly for the URL to appear, then respond
   let attempts = 0;
@@ -246,6 +355,98 @@ function handleProjects(res) {
 }
 
 // ---------------------------------------------------------------------------
+// GET /dev-servers  — detect running dev servers
+// ---------------------------------------------------------------------------
+function getTailscaleHostname() {
+  try {
+    const out = execSync("tailscale status --json", { timeout: 5000 }).toString();
+    const info = JSON.parse(out);
+    // DNSName ends with "." — strip it
+    return info.Self.DNSName.replace(/\.$/, "");
+  } catch {
+    return null;
+  }
+}
+
+let cachedTsHostname = null;
+
+function probePort(port) {
+  return new Promise((resolve) => {
+    const req = httpRequest({ hostname: "127.0.0.1", port, path: "/", method: "GET", timeout: 800 }, (res) => {
+      let body = "";
+      res.on("data", (d) => (body += d.toString().slice(0, 2000)));
+      res.on("end", () => resolve({ port, status: res.statusCode, headers: res.headers, body }));
+    });
+    req.on("error", () => resolve(null));
+    req.on("timeout", () => { req.destroy(); resolve(null); });
+    req.end();
+  });
+}
+
+function identifyServer(probe) {
+  if (!probe) return null;
+  const { port, headers, body } = probe;
+  const server = headers["x-powered-by"] || "";
+  const lower = (body || "").toLowerCase();
+
+  // Expo (Metro bundler)
+  if (lower.includes("expo") || lower.includes("metro") || server.includes("metro")) {
+    return { port, type: "expo", name: "Expo (Metro)" };
+  }
+  // Vite
+  if (lower.includes("vite") || lower.includes("/@vite") || server.includes("vite")) {
+    return { port, type: "vite", name: "Vite" };
+  }
+  // Next.js
+  if (headers["x-nextjs-page"] || lower.includes("__next") || lower.includes("next.js")) {
+    return { port, type: "next", name: "Next.js" };
+  }
+  // Generic React / CRA
+  if (lower.includes("react") || lower.includes("create-react-app")) {
+    return { port, type: "react", name: "React" };
+  }
+  // Tauri / generic dev server
+  if (lower.includes("tauri")) {
+    return { port, type: "tauri", name: "Tauri" };
+  }
+  // Express / Node
+  if (server.includes("Express")) {
+    return { port, type: "express", name: "Express" };
+  }
+  // FastAPI / Uvicorn
+  if (server.includes("uvicorn") || lower.includes("fastapi")) {
+    return { port, type: "fastapi", name: "FastAPI" };
+  }
+  // Fallback — something is listening
+  return { port, type: "unknown", name: "Dev Server" };
+}
+
+async function handleDevServers(res) {
+  if (!cachedTsHostname) cachedTsHostname = getTailscaleHostname();
+  const tsHost = cachedTsHostname;
+
+  // Find listening ports via PowerShell
+  let ports = [];
+  try {
+    const out = execSync(
+      'powershell -NoProfile -Command "Get-NetTCPConnection -State Listen | Where-Object { $_.LocalPort -ge 3000 -and $_.LocalPort -le 9999 -and ($_.LocalAddress -eq \'0.0.0.0\' -or $_.LocalAddress -eq \'::\')} | Select-Object -ExpandProperty LocalPort -Unique | Sort-Object"',
+      { timeout: 5000 }
+    ).toString();
+    ports = out.trim().split(/\r?\n/).map(Number).filter((p) => p && p !== PORT);
+  } catch { /* fallback: empty */ }
+
+  // Probe each port
+  const probes = await Promise.all(ports.map(probePort));
+  const servers = probes.map(identifyServer).filter(Boolean).map((s) => ({
+    ...s,
+    url: tsHost ? `http://${tsHost}:${s.port}` : `http://localhost:${s.port}`,
+    expoUrl: s.type === "expo" && tsHost ? `exp://${tsHost}:${s.port}` : null,
+  }));
+
+  json(res, 200, { servers, tailscaleHost: tsHost });
+}
+
+// ---------------------------------------------------------------------------
 // GET /  — mobile-friendly web UI
 // ---------------------------------------------------------------------------
 function handleUI(req, res) {
@@ -271,11 +472,13 @@ function handleUI(req, res) {
   .sessions { font-size: 0.85rem; }
   .sessions .entry { padding: 8px 0; border-bottom: 1px solid #21262d; display: flex; justify-content: space-between; align-items: center; }
   .sessions .entry button { width: auto; padding: 4px 12px; background: #da3633; font-size: 0.8rem; margin: 0; }
+  .sessions .entry.inactive { opacity: 0.45; }
   .tag { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 0.75rem; }
   .tag.ready { background: #238636; }
   .tag.connecting { background: #9e6a03; }
   .tag.stopped, .tag.error { background: #da3633; }
   .tag.running { background: #1f6feb; }
+  .tag.stale { background: #9e6a03; }
   #token-setup { text-align: center; padding: 40px 20px; }
   #token-setup input { max-width: 400px; margin: 0 auto 12px; display: block; }
   #token-setup button { max-width: 400px; margin: 0 auto; display: block; }
@@ -286,15 +489,114 @@ function handleUI(req, res) {
 <script>
 const app = document.getElementById('app');
 let token = localStorage.getItem('launcher_token');
+let refreshTimer = null;
+let cachedProjects = null;
 
 function headers() { return { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' }; }
+
+function timeAgo(iso) {
+  const s = Math.round((Date.now() - new Date(iso).getTime()) / 1000);
+  if (s < 10) return 'just now';
+  if (s < 60) return s + 's ago';
+  if (s < 3600) return Math.floor(s / 60) + 'm ago';
+  return Math.floor(s / 3600) + 'h ago';
+}
 
 async function api(method, path, body) {
   const r = await fetch(path, { method, headers: headers(), body: body ? JSON.stringify(body) : undefined });
   return r.json();
 }
 
+// --- Session list rendering (updates without re-rendering the whole page) ---
+const ACTIVE_STATUSES = new Set(['ready','connecting','stale']);
+
+function renderSessionList(sessions) {
+  const container = document.getElementById('session-list');
+  if (!container) { console.warn('[launcher] #session-list not in DOM'); return; }
+  if (!sessions || !sessions.length) {
+    container.innerHTML = '';
+    console.log('[launcher] No sessions to render');
+    return;
+  }
+
+  console.log('[launcher] Sessions:', sessions.map(s => s.id + '=' + s.status).join(', '));
+
+  // Sort: active first, then stopped/error
+  const sorted = [...sessions].sort((a, b) => {
+    const aActive = ACTIVE_STATUSES.has(a.status) ? 0 : 1;
+    const bActive = ACTIVE_STATUSES.has(b.status) ? 0 : 1;
+    return aActive - bActive;
+  });
+  const activeCount = sorted.filter(s => ACTIVE_STATUSES.has(s.status)).length;
+
+  container.innerHTML = '<div class="card sessions"><label>Sessions (' + activeCount + ' active / ' + sorted.length + ' total)</label>' +
+    sorted.map(s => {
+      const ago = s.lastActivityAt ? timeAgo(s.lastActivityAt) : '';
+      const aliveIcon = s.alive ? '\\u2022' : '\\u25cb';
+      const aliveColor = s.alive ? '#238636' : '#da3633';
+      const inactive = !ACTIVE_STATUSES.has(s.status) ? ' inactive' : '';
+      const dirName = s.cwd ? s.cwd.replace(/\\\\/g, '/').split('/').pop() : s.prompt;
+      const stopped = s.status === 'stopped' || s.status === 'error';
+      const buttons = stopped
+        ? \`<button onclick="relaunchSession('\${s.cwd}','\${s.permMode || 'bypassPermissions'}')" style="background:#238636">Relaunch</button><button onclick="killSession('\${s.id}')" style="margin-left:6px">Kill</button>\`
+        : \`<button onclick="killSession('\${s.id}')">Kill</button>\`;
+      return \`<div class="entry\${inactive}">
+        <div><b>\${dirName}</b> <span class="tag \${s.status}">\${s.status}</span> <span style="color:\${aliveColor};font-size:0.9rem">\${aliveIcon}</span><br><span style="color:#8b949e;font-size:0.75rem">\${s.permMode || '—'}\${ago ? ' · ' + ago : ''} · \${s.id}</span></div>
+        <div style="display:flex">\${buttons}</div>
+      </div>\`;
+    }).join('') + '</div>';
+}
+
+async function refreshSessions() {
+  try {
+    const { sessions } = await api('GET', '/sessions');
+    renderSessionList(sessions);
+  } catch { /* ignore fetch errors during refresh */ }
+}
+
+function renderDevServers(servers) {
+  const container = document.getElementById('dev-servers');
+  if (!container) return;
+  if (!servers || !servers.length) {
+    container.innerHTML = '';
+    return;
+  }
+
+  const TYPE_COLORS = { expo: '#4630EB', vite: '#646CFF', next: '#000', react: '#61DAFB', express: '#333', fastapi: '#009688', tauri: '#FFC131', unknown: '#8b949e' };
+
+  container.innerHTML = '<div class="card sessions"><label>Dev Servers (' + servers.length + ')</label>' +
+    servers.map(s => {
+      const color = TYPE_COLORS[s.type] || TYPE_COLORS.unknown;
+      const expoLink = s.expoUrl ? ' <a href="' + s.expoUrl + '" style="color:#4630EB;font-size:0.8rem">Open in Expo Go</a>' : '';
+      return \`<div class="entry">
+        <div><span class="tag" style="background:\${color}">\${s.name}</span> <b>:\${s.port}</b>\${expoLink}<br><a href="\${s.url}" style="color:#58a6ff;font-size:0.75rem">\${s.url}</a></div>
+      </div>\`;
+    }).join('') + '</div>';
+}
+
+async function refreshDevServers() {
+  try {
+    const { servers } = await api('GET', '/dev-servers');
+    renderDevServers(servers);
+  } catch { /* ignore */ }
+}
+
+async function refreshAll() {
+  await Promise.all([refreshSessions(), refreshDevServers()]);
+}
+
+function startAutoRefresh() {
+  stopAutoRefresh();
+  refreshTimer = setInterval(refreshAll, 5000);
+}
+
+function stopAutoRefresh() {
+  if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null; }
+}
+
+// --- Page rendering ---
 function renderTokenSetup() {
+  stopAutoRefresh();
   app.innerHTML = \`
     <div id="token-setup">
       <h1>Claude Remote Launcher</h1>
@@ -313,25 +615,19 @@ function saveToken() {
 }
 
 async function renderMain() {
-  app.innerHTML = '<h1>Claude Remote Launcher</h1><div class="card"><p>Loading projects...</p></div>';
-  const { projects } = await api('GET', '/projects');
-  const { sessions } = await api('GET', '/sessions');
+  stopAutoRefresh();
+  app.innerHTML = '<h1>Claude Remote Launcher</h1><div class="card"><p>Loading...</p></div>';
 
-  const opts = projects.map(p => '<option value="' + p.path + '">' + p.name + '</option>').join('');
-  const active = sessions.filter(s => s.status === 'running' || s.status === 'ready' || s.status === 'connecting');
-
-  let sessHtml = '';
-  if (active.length) {
-    sessHtml = '<div class="card sessions"><label>Active Sessions</label>' +
-      active.map(s => \`<div class="entry">
-        <div><b>\${s.cwd ? s.cwd.split('/').pop() : s.prompt}</b> <span class="tag \${s.status}">\${s.status}</span><br><span style="color:#8b949e;font-size:0.75rem">\${s.permMode || '—'}</span></div>
-        <button onclick="killSession('\${s.id}')">Kill</button>
-      </div>\`).join('') + '</div>';
-  }
+  const [projData, sessData] = await Promise.all([
+    cachedProjects ? Promise.resolve({ projects: cachedProjects }) : api('GET', '/projects'),
+    api('GET', '/sessions'),
+  ]);
+  cachedProjects = projData.projects;
+  const opts = cachedProjects.map(p => '<option value="' + p.path + '">' + p.name + '</option>').join('');
 
   app.innerHTML = \`
     <h1>Claude Remote Launcher</h1>
-    \${sessHtml}
+    <div id="session-list"></div>
     <div class="card">
       <label>Project</label>
       <select id="project">\${opts}</select>
@@ -346,10 +642,15 @@ async function renderMain() {
       <button id="launch-btn" onclick="launch()">Launch Remote Control</button>
     </div>
     <div id="result"></div>
+    <div id="dev-servers"></div>
     <div style="text-align:center;margin-top:20px;display:flex;gap:12px;justify-content:center">
-      <button onclick="renderMain()" style="background:#1f6feb;width:auto;padding:8px 16px">Refresh</button>
-      <button onclick="localStorage.removeItem('launcher_token');location.reload()" style="background:#30363d;width:auto;padding:8px 16px">Logout</button>
+      <button onclick="refreshAll()" style="background:#1f6feb;width:auto;padding:8px 16px">Refresh</button>
+      <button onclick="stopAutoRefresh();localStorage.removeItem('launcher_token');location.reload()" style="background:#30363d;width:auto;padding:8px 16px">Logout</button>
     </div>\`;
+
+  renderSessionList(sessData.sessions);
+  refreshDevServers();
+  startAutoRefresh();
 }
 
 async function launch() {
@@ -362,14 +663,23 @@ async function launch() {
   result.innerHTML = '<div class="status">Starting session...</div>';
 
   const data = await api('POST', '/remote-control', { cwd, permissionMode });
+
+  // Immediately refresh session list so the new session appears
+  await refreshSessions();
+
   if (data.url) {
     result.innerHTML = '<div class="status">Ready! <a href="' + data.url + '">' + data.url + '</a></div>';
     btn.disabled = false;
     btn.textContent = 'Launch Remote Control';
+  } else if (data.error) {
+    result.innerHTML = '<div class="status">Error: ' + data.error + '</div>';
+    btn.disabled = false;
+    btn.textContent = 'Launch Remote Control';
   } else {
-    // Poll for URL
+    // Poll for URL — also refreshes session list each tick
     const poll = setInterval(async () => {
       const s = await api('GET', '/status/' + data.id);
+      await refreshSessions();
       if (s.url) {
         clearInterval(poll);
         result.innerHTML = '<div class="status">Ready! <a href="' + s.url + '">' + s.url + '</a></div>';
@@ -387,7 +697,31 @@ async function launch() {
 
 async function killSession(id) {
   await api('DELETE', '/session/' + id);
-  renderMain();
+  await refreshSessions();
+}
+
+async function relaunchSession(cwd, permissionMode) {
+  const result = document.getElementById('result');
+  if (result) result.innerHTML = '<div class="status">Relaunching...</div>';
+  const data = await api('POST', '/remote-control', { cwd, permissionMode });
+  await refreshSessions();
+  if (data.url && result) {
+    result.innerHTML = '<div class="status">Ready! <a href="' + data.url + '">' + data.url + '</a></div>';
+  } else if (data.error && result) {
+    result.innerHTML = '<div class="status">Error: ' + data.error + '</div>';
+  } else if (result) {
+    const poll = setInterval(async () => {
+      const s = await api('GET', '/status/' + data.id);
+      await refreshSessions();
+      if (s.url) {
+        clearInterval(poll);
+        result.innerHTML = '<div class="status">Ready! <a href="' + s.url + '">' + s.url + '</a></div>';
+      } else if (s.status === 'error' || s.status === 'stopped') {
+        clearInterval(poll);
+        result.innerHTML = '<div class="status">Failed: ' + (s.stderr || 'unknown error') + '</div>';
+      }
+    }, 1000);
+  }
 }
 
 if (token) renderMain(); else renderTokenSetup();
@@ -405,7 +739,17 @@ const server = createServer(async (req, res) => {
 
   // Health check (no auth)
   if (req.method === "GET" && req.url === "/health") {
-    return json(res, 200, { ok: true, sessions: sessions.size });
+    // Refresh all session statuses before reporting
+    for (const s of sessions.values()) checkSessionHealth(s);
+    const active = [...sessions.values()].filter(
+      (s) => ["running", "ready", "connecting", "stale"].includes(s.status)
+    );
+    return json(res, 200, {
+      ok: true,
+      sessions: sessions.size,
+      active: active.length,
+      activeIds: active.map((s) => ({ id: s.id, status: s.status, cwd: s.cwd })),
+    });
   }
 
   // Web UI (no auth — token entered in-page)
@@ -425,8 +769,14 @@ const server = createServer(async (req, res) => {
     if (req.method === "GET" && url.pathname.startsWith("/status/")) {
       return handleStatus(res, url.pathname.split("/")[2]);
     }
+    if (req.method === "GET" && url.pathname.startsWith("/ping/")) {
+      return handlePing(res, url.pathname.split("/")[2]);
+    }
     if (req.method === "GET" && url.pathname === "/projects") {
       return handleProjects(res);
+    }
+    if (req.method === "GET" && url.pathname === "/dev-servers") {
+      return handleDevServers(res);
     }
     if (req.method === "GET" && url.pathname === "/sessions") {
       return handleList(res);
@@ -450,6 +800,8 @@ server.listen(PORT, () => {
   console.log(`  GET  /projects       — list project directories`);
   console.log(`  POST /remote-control — start remote-control session, returns URL for phone`);
   console.log(`  GET  /status/:id     — get session result`);
+  console.log(`  GET  /ping/:id       — lightweight liveness check`);
+  console.log(`  GET  /dev-servers    — detect running dev servers`);
   console.log(`  GET  /sessions       — list all sessions`);
   console.log(`  DELETE /session/:id  — kill/remove session`);
   console.log(`  GET  /health         — health check (no auth)`);
