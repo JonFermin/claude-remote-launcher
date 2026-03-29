@@ -74,13 +74,32 @@ const NAME_RE = /^[a-zA-Z0-9 _\-]{1,64}$/;
 // ---------------------------------------------------------------------------
 function isProcessAlive(proc) {
   if (!proc || proc.killed || proc.exitCode !== null) return false;
+  if (process.platform === "win32") {
+    // proc.kill(0) does not work as a liveness check on Windows —
+    // Node treats all signals as kill on Windows, so signal 0 either
+    // throws or actually terminates the process.  Fall back to tasklist.
+    try {
+      const out = execSync(`tasklist /FI "PID eq ${proc.pid}" /NH`, {
+        stdio: "pipe", encoding: "utf-8",
+      });
+      // tasklist prints "INFO: No tasks..." when the PID is gone
+      return out.includes(String(proc.pid));
+    } catch { return false; }
+  }
   try { proc.kill(0); return true; } catch { return false; }
 }
 
 function checkSessionHealth(session) {
+  const alive = isProcessAlive(session.proc);
+
+  // Recover sessions wrongly marked as stopped (e.g. stdio pipes closed on Windows)
+  if (session.status === "stopped" && alive) {
+    session.status = "ready";
+    return;
+  }
+
   if (session.status === "stopped" || session.status === "error") return;
 
-  const alive = isProcessAlive(session.proc);
   if (!alive) {
     // Grace period: don't mark brand-new sessions as stopped — the process
     // may not have fully started yet (especially on Windows).
@@ -298,9 +317,15 @@ function handleRemoteControl(req, res, body) {
   });
 
   proc.on("close", (code) => {
-    session.status = "stopped";
+    // On Windows, claude remote-control may close stdio pipes while still running.
+    // Only mark stopped if the process is truly dead.
     session.exitCode = code;
-    persistSessions();
+    setTimeout(() => {
+      if (!isProcessAlive(proc)) {
+        session.status = "stopped";
+        persistSessions();
+      }
+    }, 2000);
   });
 
   proc.on("error", (err) => {
@@ -429,7 +454,7 @@ async function handleDevServers(res) {
   let ports = [];
   try {
     const out = execSync(
-      'powershell -NoProfile -Command "Get-NetTCPConnection -State Listen | Where-Object { $_.LocalPort -ge 3000 -and $_.LocalPort -le 9999 -and ($_.LocalAddress -eq \'0.0.0.0\' -or $_.LocalAddress -eq \'::\')} | Select-Object -ExpandProperty LocalPort -Unique | Sort-Object"',
+      'powershell -NoProfile -Command "Get-NetTCPConnection -State Listen | Where-Object { $_.LocalPort -ge 3000 -and $_.LocalPort -le 9999 } | Select-Object -ExpandProperty LocalPort -Unique | Sort-Object"',
       { timeout: 5000 }
     ).toString();
     ports = out.trim().split(/\r?\n/).map(Number).filter((p) => p && p !== PORT);
@@ -467,8 +492,8 @@ function handleUI(req, res) {
   button { background: #238636; border: none; font-weight: 600; cursor: pointer; }
   button:active { background: #2ea043; }
   button:disabled { opacity: 0.5; }
-  .status { padding: 12px; border-radius: 8px; background: #161b22; border: 1px solid #30363d; word-break: break-all; }
-  .status a { color: #58a6ff; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .spinner { display:inline-block; width:14px; height:14px; border:2px solid #30363d; border-top-color:#58a6ff; border-radius:50%; animation:spin .8s linear infinite; vertical-align:middle; margin-right:6px; }
   .sessions { font-size: 0.85rem; }
   .sessions .entry { padding: 8px 0; border-bottom: 1px solid #21262d; display: flex; justify-content: space-between; align-items: center; }
   .sessions .entry button { width: auto; padding: 4px 12px; background: #da3633; font-size: 0.8rem; margin: 0; }
@@ -540,8 +565,9 @@ function renderSessionList(sessions) {
       const buttons = stopped
         ? \`<button onclick="relaunchSession('\${s.cwd}','\${s.permMode || 'bypassPermissions'}')" style="background:#238636">Relaunch</button><button onclick="killSession('\${s.id}')" style="margin-left:6px">Kill</button>\`
         : \`<button onclick="killSession('\${s.id}')">Kill</button>\`;
+      const spinnerHtml = s.status === 'connecting' ? '<span class="spinner"></span>' : '';
       return \`<div class="entry\${inactive}">
-        <div><b>\${dirName}</b> <span class="tag \${s.status}">\${s.status}</span> <span style="color:\${aliveColor};font-size:0.9rem">\${aliveIcon}</span><br><span style="color:#8b949e;font-size:0.75rem">\${s.permMode || '—'}\${ago ? ' · ' + ago : ''} · \${s.id}</span></div>
+        <div>\${spinnerHtml}<b>\${dirName}</b> <span class="tag \${s.status}">\${s.status}</span> <span style="color:\${aliveColor};font-size:0.9rem">\${aliveIcon}</span><br><span style="color:#8b949e;font-size:0.75rem">\${s.permMode || '—'}\${ago ? ' · ' + ago : ''} · \${s.id}</span></div>
         <div style="display:flex">\${buttons}</div>
       </div>\`;
     }).join('') + '</div>';
@@ -641,7 +667,6 @@ async function renderMain() {
       </select>
       <button id="launch-btn" onclick="launch()">Launch Remote Control</button>
     </div>
-    <div id="result"></div>
     <div id="dev-servers"></div>
     <div style="text-align:center;margin-top:20px;display:flex;gap:12px;justify-content:center">
       <button onclick="refreshAll()" style="background:#1f6feb;width:auto;padding:8px 16px">Refresh</button>
@@ -655,43 +680,19 @@ async function renderMain() {
 
 async function launch() {
   const btn = document.getElementById('launch-btn');
-  const result = document.getElementById('result');
   const cwd = document.getElementById('project').value;
   const permissionMode = document.getElementById('perm-mode').value;
   btn.disabled = true;
-  btn.textContent = 'Launching...';
-  result.innerHTML = '<div class="status">Starting session...</div>';
+  btn.textContent = 'Launching…';
 
-  const data = await api('POST', '/remote-control', { cwd, permissionMode });
-
-  // Immediately refresh session list so the new session appears
-  await refreshSessions();
-
-  if (data.url) {
-    result.innerHTML = '<div class="status">Ready! <a href="' + data.url + '">' + data.url + '</a></div>';
+  try {
+    await api('POST', '/remote-control', { cwd, permissionMode });
+    await refreshSessions();
+  } catch (e) {
+    console.error('[launcher] launch failed', e);
+  } finally {
     btn.disabled = false;
     btn.textContent = 'Launch Remote Control';
-  } else if (data.error) {
-    result.innerHTML = '<div class="status">Error: ' + data.error + '</div>';
-    btn.disabled = false;
-    btn.textContent = 'Launch Remote Control';
-  } else {
-    // Poll for URL — also refreshes session list each tick
-    const poll = setInterval(async () => {
-      const s = await api('GET', '/status/' + data.id);
-      await refreshSessions();
-      if (s.url) {
-        clearInterval(poll);
-        result.innerHTML = '<div class="status">Ready! <a href="' + s.url + '">' + s.url + '</a></div>';
-        btn.disabled = false;
-        btn.textContent = 'Launch Remote Control';
-      } else if (s.status === 'error' || s.status === 'stopped') {
-        clearInterval(poll);
-        result.innerHTML = '<div class="status">Failed: ' + (s.stderr || 'unknown error') + '</div>';
-        btn.disabled = false;
-        btn.textContent = 'Launch Remote Control';
-      }
-    }, 1000);
   }
 }
 
@@ -700,27 +701,24 @@ async function killSession(id) {
   await refreshSessions();
 }
 
+let _relaunchBusy = false;
 async function relaunchSession(cwd, permissionMode) {
-  const result = document.getElementById('result');
-  if (result) result.innerHTML = '<div class="status">Relaunching...</div>';
-  const data = await api('POST', '/remote-control', { cwd, permissionMode });
-  await refreshSessions();
-  if (data.url && result) {
-    result.innerHTML = '<div class="status">Ready! <a href="' + data.url + '">' + data.url + '</a></div>';
-  } else if (data.error && result) {
-    result.innerHTML = '<div class="status">Error: ' + data.error + '</div>';
-  } else if (result) {
-    const poll = setInterval(async () => {
-      const s = await api('GET', '/status/' + data.id);
-      await refreshSessions();
-      if (s.url) {
-        clearInterval(poll);
-        result.innerHTML = '<div class="status">Ready! <a href="' + s.url + '">' + s.url + '</a></div>';
-      } else if (s.status === 'error' || s.status === 'stopped') {
-        clearInterval(poll);
-        result.innerHTML = '<div class="status">Failed: ' + (s.stderr || 'unknown error') + '</div>';
-      }
-    }, 1000);
+  if (_relaunchBusy) return;
+  _relaunchBusy = true;
+
+  // Disable all relaunch buttons while in flight
+  document.querySelectorAll('button').forEach(b => {
+    if (b.textContent === 'Relaunch') { b.disabled = true; b.textContent = 'Launching…'; }
+  });
+
+  try {
+    await api('POST', '/remote-control', { cwd, permissionMode });
+    await refreshSessions();
+  } catch (e) {
+    console.error('[launcher] relaunch failed', e);
+  } finally {
+    _relaunchBusy = false;
+    // Buttons restored on next refreshSessions render
   }
 }
 
