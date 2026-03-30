@@ -10,6 +10,17 @@ A lightweight Node.js server runs on your dev machine and exposes an API + mobil
 Phone/Tablet  -->  Tailscale (WireGuard)  -->  Your PC  -->  Claude CLI
 ```
 
+## Project Structure
+
+```
+server.js              Entry point — config, HTTP routing, route handlers
+lib/
+  sessions.js          Session lifecycle — tracking, persistence, health checks
+  dev-servers.js       Dev server discovery — port probing, server identification
+  ui.js                Serves the web UI
+  ui.html              Mobile-friendly web UI (HTML/CSS/JS)
+```
+
 ## Quick Start
 
 ### 1. Install dependencies

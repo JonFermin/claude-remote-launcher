@@ -11,26 +11,39 @@ Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction Silent
 
 $action = New-ScheduledTaskAction `
     -Execute $nodePath `
-    -Argument $serverPath `
+    -Argument "`"$serverPath`"" `
     -WorkingDirectory $workDir
 
-$trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+$trigger = New-ScheduledTaskTrigger -AtStartup
 
 $settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
-    -RestartCount 3 `
+    -RestartCount 999 `
     -RestartInterval (New-TimeSpan -Minutes 1) `
-    -ExecutionTimeLimit (New-TimeSpan -Days 365)
+    -ExecutionTimeLimit (New-TimeSpan -Days 0)
+
+$principal = New-ScheduledTaskPrincipal `
+    -UserId $env:USERNAME `
+    -LogonType S4U `
+    -RunLevel Highest
 
 Register-ScheduledTask `
     -TaskName $taskName `
     -Action $action `
     -Trigger $trigger `
     -Settings $settings `
-    -Description "Webhook server for remote Claude Code session launching" `
-    -RunLevel Highest
+    -Principal $principal `
+    -Description "Webhook server for remote Claude Code session launching"
 
-Write-Host "Task '$taskName' registered. It will start at next login."
-Write-Host "To start it now: Start-ScheduledTask -TaskName '$taskName'"
-Write-Host "To check status: Get-ScheduledTask -TaskName '$taskName'"
+# Start immediately
+Start-ScheduledTask -TaskName $taskName
+
+Write-Host ""
+Write-Host "Task '$taskName' registered and started." -ForegroundColor Green
+Write-Host ""
+Write-Host "Commands:"
+Write-Host "  Check status:  Get-ScheduledTask -TaskName '$taskName'"
+Write-Host "  Stop:          Stop-ScheduledTask -TaskName '$taskName'"
+Write-Host "  Start:         Start-ScheduledTask -TaskName '$taskName'"
+Write-Host "  Uninstall:     Unregister-ScheduledTask -TaskName '$taskName' -Confirm:`$false"
