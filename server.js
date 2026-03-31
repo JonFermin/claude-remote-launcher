@@ -1,8 +1,9 @@
 import { createServer } from "node:http";
-import { spawn } from "node:child_process";
+import { spawn, execSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { readFileSync, existsSync, readdirSync, statSync } from "node:fs";
-import { resolve, normalize } from "node:path";
+import { resolve, normalize, join, dirname } from "node:path";
+import { homedir } from "node:os";
 
 import { sessions, persistSessions, loadSessions, isProcessAlive, checkSessionHealth, startHealthSweep } from "./lib/sessions.js";
 import { handleDevServers } from "./lib/dev-servers.js";
@@ -17,6 +18,12 @@ if (existsSync(ENV_PATH)) {
     const m = line.match(/^\s*([A-Z_]+)\s*=\s*(.+)/);
     if (m) process.env[m[1]] = m[2].trim();
   }
+}
+
+// Ensure npm global bin is on PATH (Task Scheduler doesn't load shell profile)
+const npmGlobalBin = join(homedir(), "AppData", "Roaming", "npm");
+if (!process.env.PATH.includes(npmGlobalBin)) {
+  process.env.PATH = npmGlobalBin + ";" + process.env.PATH;
 }
 
 const TOKEN = process.env.LAUNCHER_TOKEN;
@@ -190,7 +197,7 @@ function handleRemoteControl(req, res, body) {
 
   const proc = spawn("claude", args, {
     cwd: workDir,
-    shell: false,
+    shell: true,
     env: { ...process.env, FORCE_COLOR: "0" },
   });
 
@@ -221,7 +228,7 @@ function handleRemoteControl(req, res, body) {
     }
 
     // Parse the session URL from stdout
-    const urlMatch = chunk.match(/https:\/\/claude\.ai\/code\/[^\s\x1b]*/);
+    const urlMatch = chunk.match(/https:\/\/claude\.ai\/code[/?][^\s\x00-\x1f]*/);
     if (urlMatch && !session.url) {
       session.url = urlMatch[0];
       session.status = "ready";
