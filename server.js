@@ -94,6 +94,14 @@ const AUTH_WINDOW_MS = 60_000; // 1 minute window
 const AUTH_MAX_FAILURES = 10;  // max failures per IP per window
 const authFailures = new Map(); // ip -> { count, resetAt }
 
+// Periodically purge expired rate-limit entries to prevent unbounded memory growth
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, record] of authFailures) {
+    if (now >= record.resetAt) authFailures.delete(ip);
+  }
+}, AUTH_WINDOW_MS);
+
 function auth(req) {
   const h = req.headers.authorization || "";
   const expected = `Bearer ${TOKEN}`;
