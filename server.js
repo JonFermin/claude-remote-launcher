@@ -1,8 +1,9 @@
 import { createServer } from "node:http";
-import { spawn, execSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { readFileSync, existsSync } from "node:fs";
 import { normalize, join } from "node:path";
 import { homedir } from "node:os";
+import { timingSafeEqual } from "node:crypto";
 
 import { sessions, persistSessionsNow, loadSessions, checkSessionHealth, startHealthSweep } from "./lib/sessions.js";
 import { createHandlers } from "./lib/handlers.js";
@@ -13,10 +14,11 @@ import { handleUI } from "./lib/ui.js";
 // Config
 // ---------------------------------------------------------------------------
 const ENV_PATH = new URL(".env", import.meta.url).pathname.replace(/^\/([A-Z]:)/, "$1");
+const VALID_ENV_KEYS = new Set(["LAUNCHER_TOKEN", "PORT", "ALLOWED_DIRS", "MAX_SESSIONS", "TAILNET_DOMAIN", "STDOUT_BUFFER_KB"]);
 if (existsSync(ENV_PATH)) {
   for (const line of readFileSync(ENV_PATH, "utf-8").split("\n")) {
     const m = line.match(/^\s*([A-Z_]+)\s*=\s*(.+)/);
-    if (m) process.env[m[1]] = m[2].trim();
+    if (m && VALID_ENV_KEYS.has(m[1])) process.env[m[1]] = m[2].trim();
   }
 }
 
@@ -86,7 +88,13 @@ function readBody(req) {
 
 function auth(req) {
   const h = req.headers.authorization || "";
-  return h === `Bearer ${TOKEN}`;
+  const expected = `Bearer ${TOKEN}`;
+  if (h.length !== expected.length) return false;
+  try {
+    return timingSafeEqual(Buffer.from(h), Buffer.from(expected));
+  } catch {
+    return false;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -104,16 +112,7 @@ const server = createServer(async (req, res) => {
 
   // Health check (no auth)
   if (req.method === "GET" && req.url === "/health") {
-    for (const s of sessions.values()) checkSessionHealth(s);
-    const active = [...sessions.values()].filter(
-      (s) => ["running", "ready", "connecting", "stale"].includes(s.status)
-    );
-    return json(res, 200, {
-      ok: true,
-      sessions: sessions.size,
-      active: active.length,
-      activeIds: active.map((s) => ({ id: s.id, status: s.status, cwd: s.cwd })),
-    });
+    return json(res, 200, { ok: true });
   }
 
   // Web UI (no auth — token entered in-page)
@@ -151,7 +150,8 @@ const server = createServer(async (req, res) => {
 
     json(res, 404, { error: "Not found" });
   } catch (err) {
-    json(res, 500, { error: err.message });
+    console.error("[server] Unhandled error:", err);
+    json(res, 500, { error: "Internal server error" });
   }
 });
 
@@ -192,7 +192,7 @@ function shutdown(signal) {
     if (session.proc && !session.proc.killed) {
       try {
         if (process.platform === "win32") {
-          execSync(`taskkill /PID ${session.proc.pid} /T /F`, { stdio: "ignore" });
+          spawnSync("taskkill", ["/PID", String(session.proc.pid), "/T", "/F"], { stdio: "ignore" });
         } else {
           session.proc.kill("SIGTERM");
         }
