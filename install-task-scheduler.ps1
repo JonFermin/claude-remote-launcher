@@ -14,7 +14,7 @@ $action = New-ScheduledTaskAction `
     -Argument "`"$serverPath`"" `
     -WorkingDirectory $workDir
 
-$trigger = New-ScheduledTaskTrigger -AtStartup
+$trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 
 $settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
@@ -25,7 +25,7 @@ $settings = New-ScheduledTaskSettingsSet `
 
 $principal = New-ScheduledTaskPrincipal `
     -UserId $env:USERNAME `
-    -LogonType S4U `
+    -LogonType Interactive `
     -RunLevel Highest
 
 Register-ScheduledTask `
