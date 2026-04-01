@@ -9,7 +9,9 @@
 
 The application is a webhook server that spawns Claude Code `remote-control` sessions. It listens on HTTP, relies on Tailscale for network-level encryption, and uses a bearer token for API authentication. The codebase is small (~1,200 lines) with zero npm dependencies, which significantly reduces supply-chain risk.
 
-**4 issues fixed in this audit. 6 additional findings documented below for awareness.**
+**7 issues fixed in this audit (across 2 rounds). Additional findings documented below for awareness.**
+
+**Methodology:** Initial audit followed by 3 independent agent teams (injection/XSS, auth/DoS, network/config) that cross-validated findings and discovered 3 additional issues.
 
 ---
 
@@ -42,6 +44,30 @@ The application is a webhook server that spawns Claude Code `remote-control` ses
 **Description:** Dead sessions (status `stopped` or `error`) remained in the in-memory `Map` and on-disk `sessions.json` forever. Over weeks/months of use, this would cause memory growth and increasingly large persistence files.
 
 **Fix:** The health sweep now auto-prunes dead sessions older than 24 hours.
+
+### 5. [MEDIUM] XSS in Dev Server `copyToClipboard` onclick + `javascript:` URLs
+
+**File:** `lib/ui-client.js:506-535`
+**Found by:** Agent Team 1 (Injection), corroborated cross-team
+**Description:** Dev server URLs were escaped with `escapeAttr()` (HTML-only) and injected into `onclick="copyToClipboard('...')"`, the same HTML-entity-decode XSS pattern as finding #1. Additionally, server-discovered URLs had no protocol allowlist, so a crafted `javascript:` URL in an `<a href>` could execute arbitrary code.
+
+**Fix:** Added `escapeJsStringInAttr()` for the onclick handler. Added protocol allowlist (`http`, `https`, `exp`) that sanitizes URLs before rendering into `href` or onclick attributes.
+
+### 6. [MEDIUM] Server Bound to 0.0.0.0 (All Interfaces)
+
+**File:** `server.js:209`
+**Found by:** Agent Team 3 (Network)
+**Description:** `server.listen(PORT)` without a host bound to all network interfaces. Since Tailscale Serve proxies from localhost, the server was unnecessarily reachable on LAN/Wi-Fi interfaces without Tailscale's encryption or ACLs.
+
+**Fix:** Changed to `server.listen(PORT, "127.0.0.1")`.
+
+### 7. [LOW] Token Length Oracle in Auth Comparison
+
+**File:** `server.js:118`
+**Found by:** Agent Team 2 (Auth)
+**Description:** The `h.length === expected.length` guard before `timingSafeEqual` leaked whether the submitted token had the correct length via timing differences. An attacker could binary-search the token length (though this alone is not exploitable).
+
+**Fix:** Replaced with HMAC-based comparison that hashes both values to fixed-length digests before `timingSafeEqual`, eliminating the length check entirely.
 
 ---
 
@@ -85,7 +111,38 @@ The application is a webhook server that spawns Claude Code `remote-control` ses
 
 **Recommendation:** Consider making auto-serve opt-in via an environment variable.
 
-### 10. [INFO] CSP Allows `unsafe-inline` for Scripts and Styles
+### 10. [MEDIUM] Active Sessions Can Escape 24h Pruning
+
+**File:** `lib/sessions.js:129`
+**Found by:** Agent Team 2 (DoS)
+**Description:** The 24h pruning only targets `stopped` or `error` sessions. A session stuck in `ready` or `stale` with a null `proc` (e.g., after server restart + status flip) could persist indefinitely. The health sweep should catch most cases via `checkSessionHealth`, but edge cases exist.
+
+**Recommendation:** Add a maximum absolute age (e.g., 48h) that prunes any session regardless of status.
+
+### 11. [LOW] .env Parser Does Not Strip Quotes
+
+**File:** `server.js:21`
+**Found by:** Agent Team 3 (Config)
+**Description:** `LAUNCHER_TOKEN="abc123"` would include the quotes in the token value, causing silent auth mismatches. Users familiar with dotenv-style configs may expect quote stripping.
+
+**Recommendation:** Strip matching outer quotes from values.
+
+### 12. [LOW] sessions.json Written with Default Permissions (0644)
+
+**File:** `lib/sessions.js:34`
+**Found by:** Agent Team 3 (Config)
+**Description:** On shared systems, other users could read session stdout/stderr which may contain sensitive Claude output. `writeFileSync` uses the process umask (typically 0644).
+
+**Recommendation:** Use `writeFileSync(path, data, { mode: 0o600 })`.
+
+### 13. [LOW] Missing HSTS Header
+
+**Found by:** Agent Team 3 (Network)
+**Description:** When accessed via Tailscale Serve (HTTPS), no `Strict-Transport-Security` header is set to prevent protocol downgrade.
+
+**Recommendation:** Add `res.setHeader("Strict-Transport-Security", "max-age=31536000")`.
+
+### 14. [INFO] CSP Allows `unsafe-inline` for Scripts and Styles
 
 **File:** `lib/ui.js:17`
 **Description:** The Content-Security-Policy uses `script-src 'unsafe-inline'` and `style-src 'unsafe-inline'`. This is necessary because the UI is a single-file app with inline JS/CSS, but it weakens XSS protections (mitigated by the escaping fixes above).

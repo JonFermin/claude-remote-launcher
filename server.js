@@ -3,7 +3,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { readFileSync, existsSync } from "node:fs";
 import { normalize, join, sep } from "node:path";
 import { homedir } from "node:os";
-import { timingSafeEqual } from "node:crypto";
+import { timingSafeEqual, createHmac } from "node:crypto";
 
 import { sessions, persistSessionsNow, loadSessions, checkSessionHealth, startHealthSweep } from "./lib/sessions.js";
 import { createHandlers } from "./lib/handlers.js";
@@ -114,10 +114,15 @@ function auth(req) {
     return false; // rate-limited, reject without even checking
   }
 
+  // Compare using HMAC to avoid leaking token length via the length check
+  // (timingSafeEqual requires equal-length buffers, so we hash both to fixed-length)
   let ok = false;
-  if (h.length === expected.length) {
-    try { ok = timingSafeEqual(Buffer.from(h), Buffer.from(expected)); } catch {}
-  }
+  try {
+    const key = "auth-compare";
+    const a = createHmac("sha256", key).update(h).digest();
+    const b = createHmac("sha256", key).update(expected).digest();
+    ok = timingSafeEqual(a, b);
+  } catch {}
 
   if (!ok) {
     if (!record || now >= record.resetAt) {
@@ -206,7 +211,7 @@ const server = createServer(async (req, res) => {
 // ---------------------------------------------------------------------------
 // Listen + Tailscale
 // ---------------------------------------------------------------------------
-server.listen(PORT, () => {
+server.listen(PORT, "127.0.0.1", () => {
   console.log(`Claude Remote Launcher listening on http://localhost:${PORT}`);
   console.log(`Sessions limit: ${MAX_SESSIONS}`);
   console.log(`Allowed dirs: ${ALLOWED_DIRS.join(", ")}`);
