@@ -1,7 +1,7 @@
 import { createServer } from "node:http";
 import { spawn, spawnSync } from "node:child_process";
 import { readFileSync, existsSync } from "node:fs";
-import { normalize, join } from "node:path";
+import { normalize, join, sep } from "node:path";
 import { homedir } from "node:os";
 import { timingSafeEqual } from "node:crypto";
 
@@ -49,9 +49,10 @@ loadSessions();
 startHealthSweep();
 
 function isAllowedDir(dir) {
-  const norm = normalize(dir).replace(/[\\/]$/, "") + "\\";
+  // Use platform-native separator so this works on both Windows and Unix
+  const norm = normalize(dir).replace(/[\\/]$/, "") + sep;
   return ALLOWED_DIRS.some((prefix) => {
-    const p = prefix.replace(/[\\/]$/, "") + "\\";
+    const p = normalize(prefix).replace(/[\\/]$/, "") + sep;
     return norm === p || norm.startsWith(p);
   });
 }
@@ -86,15 +87,42 @@ function readBody(req) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Auth with brute-force rate limiting
+// ---------------------------------------------------------------------------
+const AUTH_WINDOW_MS = 60_000; // 1 minute window
+const AUTH_MAX_FAILURES = 10;  // max failures per IP per window
+const authFailures = new Map(); // ip -> { count, resetAt }
+
 function auth(req) {
   const h = req.headers.authorization || "";
   const expected = `Bearer ${TOKEN}`;
-  if (h.length !== expected.length) return false;
-  try {
-    return timingSafeEqual(Buffer.from(h), Buffer.from(expected));
-  } catch {
-    return false;
+
+  // Rate-limit check
+  const ip = req.socket.remoteAddress || "unknown";
+  const now = Date.now();
+  const record = authFailures.get(ip);
+  if (record && record.count >= AUTH_MAX_FAILURES && now < record.resetAt) {
+    return false; // rate-limited, reject without even checking
   }
+
+  let ok = false;
+  if (h.length === expected.length) {
+    try { ok = timingSafeEqual(Buffer.from(h), Buffer.from(expected)); } catch {}
+  }
+
+  if (!ok) {
+    if (!record || now >= record.resetAt) {
+      authFailures.set(ip, { count: 1, resetAt: now + AUTH_WINDOW_MS });
+    } else {
+      record.count++;
+    }
+  } else {
+    // Successful auth — clear failures for this IP
+    authFailures.delete(ip);
+  }
+
+  return ok;
 }
 
 // ---------------------------------------------------------------------------
@@ -108,6 +136,10 @@ const { handleStatus, handleList, handlePing, handleDelete, handleRemoteControl,
 // Router
 // ---------------------------------------------------------------------------
 const server = createServer(async (req, res) => {
+  // Security headers on all responses
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+
   if (req.method === "OPTIONS") { res.writeHead(204); return res.end(); }
 
   // Health check (no auth)
@@ -121,7 +153,15 @@ const server = createServer(async (req, res) => {
   }
 
   // Auth check for all other routes
-  if (!auth(req)) return json(res, 401, { error: "Unauthorized" });
+  if (!auth(req)) {
+    // Return 429 if rate-limited, 401 otherwise
+    const ip = req.socket.remoteAddress || "unknown";
+    const record = authFailures.get(ip);
+    if (record && record.count >= AUTH_MAX_FAILURES && Date.now() < record.resetAt) {
+      return json(res, 429, { error: "Too many failed attempts, try again later" });
+    }
+    return json(res, 401, { error: "Unauthorized" });
+  }
 
   try {
     const url = new URL(req.url, `http://localhost:${PORT}`);

@@ -3,8 +3,9 @@
 
 $taskName = "ClaudeRemoteLauncher"
 $nodePath = (Get-Command node).Source
-$serverPath = "$env:USERPROFILE\DEVELOP\claude-remote-launcher\server.js"
-$workDir = "$env:USERPROFILE\DEVELOP\claude-remote-launcher"
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$serverPath = Join-Path $scriptDir "server.js"
+$workDir = $scriptDir
 
 # Remove existing task if present
 Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
@@ -26,7 +27,7 @@ $settings = New-ScheduledTaskSettingsSet `
 $principal = New-ScheduledTaskPrincipal `
     -UserId $env:USERNAME `
     -LogonType Interactive `
-    -RunLevel Highest
+    -RunLevel Limited
 
 Register-ScheduledTask `
     -TaskName $taskName `
