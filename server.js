@@ -7,7 +7,7 @@ import { timingSafeEqual } from "node:crypto";
 
 import { sessions, persistSessionsNow, loadSessions, checkSessionHealth, startHealthSweep } from "./lib/sessions.js";
 import { createHandlers } from "./lib/handlers.js";
-import { handleDevServers } from "./lib/dev-servers.js";
+import { handleDevServers, handleKillDevServer } from "./lib/dev-servers.js";
 import { handleUI } from "./lib/ui.js";
 
 // ---------------------------------------------------------------------------
@@ -180,6 +180,10 @@ const server = createServer(async (req, res) => {
     }
     if (req.method === "GET" && url.pathname === "/dev-servers") {
       return handleDevServers(res, json, PORT, TAILNET_DOMAIN);
+    }
+    if (req.method === "DELETE" && url.pathname.startsWith("/dev-server/")) {
+      const port = parseInt(url.pathname.split("/")[2], 10);
+      return handleKillDevServer(res, json, port, PORT);
     }
     if (req.method === "GET" && url.pathname === "/sessions") {
       return handleList(res);
