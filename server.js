@@ -1,25 +1,26 @@
 import { createServer } from "node:http";
 import { spawn, spawnSync } from "node:child_process";
 import { readFileSync, existsSync } from "node:fs";
-import { normalize, join, sep } from "node:path";
+import { normalize, join } from "node:path";
 import { homedir } from "node:os";
 import { timingSafeEqual } from "node:crypto";
+import { fileURLToPath } from "node:url";
 
-import { sessions, persistSessionsNow, loadSessions, checkSessionHealth, startHealthSweep } from "./lib/sessions.js";
+import { sessions, persistSessionsNow, loadSessions, startHealthSweep } from "./lib/sessions.js";
 import { createHandlers } from "./lib/handlers.js";
 import { handleDevServers } from "./lib/dev-servers.js";
 import { handleUI } from "./lib/ui.js";
+import { makeIsAllowedDir } from "./lib/paths.js";
+import { parseEnv } from "./lib/env-parse.js";
 
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
-const ENV_PATH = new URL(".env", import.meta.url).pathname.replace(/^\/([A-Z]:)/, "$1");
+const ENV_PATH = fileURLToPath(new URL(".env", import.meta.url));
 const VALID_ENV_KEYS = new Set(["LAUNCHER_TOKEN", "PORT", "ALLOWED_DIRS", "MAX_SESSIONS", "TAILNET_DOMAIN", "STDOUT_BUFFER_KB"]);
 if (existsSync(ENV_PATH)) {
-  for (const line of readFileSync(ENV_PATH, "utf-8").split("\n")) {
-    const m = line.match(/^\s*([A-Z_]+)\s*=\s*(.+)/);
-    if (m && VALID_ENV_KEYS.has(m[1])) process.env[m[1]] = m[2].trim();
-  }
+  const parsed = parseEnv(readFileSync(ENV_PATH, "utf-8"), VALID_ENV_KEYS);
+  for (const [k, v] of Object.entries(parsed)) process.env[k] = v;
 }
 
 // Ensure npm global bin is on PATH (Task Scheduler doesn't load shell profile)
@@ -48,14 +49,7 @@ const TAILNET_DOMAIN = process.env.TAILNET_DOMAIN || "";
 loadSessions();
 startHealthSweep();
 
-function isAllowedDir(dir) {
-  // Use platform-native separator so this works on both Windows and Unix
-  const norm = normalize(dir).replace(/[\\/]$/, "") + sep;
-  return ALLOWED_DIRS.some((prefix) => {
-    const p = normalize(prefix).replace(/[\\/]$/, "") + sep;
-    return norm === p || norm.startsWith(p);
-  });
-}
+const isAllowedDir = makeIsAllowedDir(ALLOWED_DIRS);
 
 const VALID_PERMISSION_MODES = new Set(["bypassPermissions", "acceptEdits", "dontAsk", "default", "plan"]);
 const VALID_SPAWN_MODES = new Set(["same-dir", "worktree", "session"]);
@@ -124,6 +118,15 @@ function auth(req) {
 
   return ok;
 }
+
+// Periodically drop expired rate-limit records so the map doesn't grow
+// unbounded on long-running instances.
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, rec] of authFailures) {
+    if (now >= rec.resetAt) authFailures.delete(ip);
+  }
+}, AUTH_WINDOW_MS).unref();
 
 // ---------------------------------------------------------------------------
 // Handlers
@@ -198,6 +201,23 @@ const server = createServer(async (req, res) => {
 // ---------------------------------------------------------------------------
 // Listen + Tailscale
 // ---------------------------------------------------------------------------
+function isPortAlreadyServed(port) {
+  try {
+    const result = spawnSync("tailscale", ["serve", "status", "--json"], {
+      stdio: "pipe", encoding: "utf-8", timeout: 5000,
+    });
+    if (result.status !== 0 || !result.stdout) return false;
+    const status = JSON.parse(result.stdout);
+    const proxyTarget = `:${port}`;
+    for (const cfg of Object.values(status?.Web || {})) {
+      for (const handler of Object.values(cfg?.Handlers || {})) {
+        if (handler.Proxy?.includes(proxyTarget)) return true;
+      }
+    }
+    return false;
+  } catch { return false; }
+}
+
 server.listen(PORT, () => {
   console.log(`Claude Remote Launcher listening on http://localhost:${PORT}`);
   console.log(`Sessions limit: ${MAX_SESSIONS}`);
@@ -212,6 +232,11 @@ server.listen(PORT, () => {
   console.log(`  GET  /sessions       — list all sessions`);
   console.log(`  DELETE /session/:id  — kill/remove session`);
   console.log(`  GET  /health         — health check (no auth)`);
+
+  if (isPortAlreadyServed(PORT)) {
+    console.log(`[tailscale] port ${PORT} already served — skipping re-registration`);
+    return;
+  }
 
   const ts = spawn("tailscale", ["serve", "--bg", String(PORT)], { shell: false });
   ts.stdout.on("data", (d) => console.log(`[tailscale] ${d.toString().trim()}`));

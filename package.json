@@ -3,9 +3,14 @@
   "version": "1.0.0",
   "description": "Webhook server to cold-start Claude Code sessions remotely",
   "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "start": "node server.js",
+    "test": "node --test test/",
     "generate-token": "node -e \"import('crypto').then(c => console.log(c.randomBytes(32).toString('hex')))\""
   },
   "dependencies": {}
 }
+
