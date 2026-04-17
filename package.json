@@ -8,7 +8,7 @@
   },
   "scripts": {
     "start": "node server.js",
-    "test": "node --test test/",
+    "test": "node --test test/*.test.js",
     "generate-token": "node -e \"import('crypto').then(c => console.log(c.randomBytes(32).toString('hex')))\""
   },
   "dependencies": {}
