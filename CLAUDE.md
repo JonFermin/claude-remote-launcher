@@ -24,7 +24,7 @@ Service install: `powershell -ExecutionPolicy Bypass -File install-task-schedule
 - `GET /dev-servers` — discovers running dev servers on the machine
 - `GET /` — serves the web UI (no auth); all API routes require `Bearer` token
 
-**`lib/sessions.js`** — Session lifecycle. In-memory `Map` persisted to `sessions.json`. Handles Windows-specific liveness checking via `tasklist` (since `kill(0)` doesn't work on Windows). Health sweep runs every 30s, marks sessions stale after 2min of no stdout.
+**`lib/sessions.js`** — Session lifecycle. In-memory `Map` persisted to `sessions.json`. Handles Windows-specific liveness checking via `tasklist` (since `kill(0)` doesn't work on Windows). Health sweep runs every 30s. Default TTL is 24h and staleness threshold is 15min of no stdout — both tuned around upstream Claude Code's 10-min remote-control poll cadence. Override with `SESSION_TTL_HOURS` (0 to disable) and `STALE_THRESHOLD_MIN`.
 
 **`lib/dev-servers.js`** — Probes ports 3000-9999 via PowerShell `Get-NetTCPConnection`, then HTTP-probes each to identify server type (Expo, Vite, Next.js, etc.). Cross-references with `tailscale serve status` to generate correct remote URLs.
 
