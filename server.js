@@ -29,6 +29,26 @@ if (!process.env.PATH.includes(npmGlobalBin)) {
   process.env.PATH = npmGlobalBin + ";" + process.env.PATH;
 }
 
+// Resolve `claude` to an absolute path once at startup so later PATH changes
+// or shadowing files dropped into an earlier PATH directory can't hijack the
+// spawn. We still need `shell: true` for .cmd on Windows, but the command
+// itself is now a fixed absolute path instead of a dynamic PATH lookup.
+const CLAUDE_BIN = (() => {
+  const finder = process.platform === "win32" ? "where" : "which";
+  const r = spawnSync(finder, ["claude"], { encoding: "utf-8" });
+  if (r.status !== 0) {
+    console.error(`[startup] \`claude\` CLI not found on PATH (via ${finder}). Install it or adjust PATH.`);
+    process.exit(1);
+  }
+  const resolved = r.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean)[0];
+  if (!resolved) {
+    console.error("[startup] `claude` lookup returned empty output.");
+    process.exit(1);
+  }
+  console.log(`[startup] Using claude binary: ${resolved}`);
+  return resolved;
+})();
+
 const TOKEN = process.env.LAUNCHER_TOKEN;
 if (!TOKEN) {
   console.error("LAUNCHER_TOKEN not set. Copy .env.example to .env and set a token.");
@@ -132,7 +152,7 @@ setInterval(() => {
 // Handlers
 // ---------------------------------------------------------------------------
 const { handleStatus, handleList, handlePing, handleDelete, handleRemoteControl, handleProjects } = createHandlers({
-  json, MAX_SESSIONS, ALLOWED_DIRS, VALID_PERMISSION_MODES, VALID_SPAWN_MODES, NAME_RE, isAllowedDir,
+  json, MAX_SESSIONS, ALLOWED_DIRS, VALID_PERMISSION_MODES, VALID_SPAWN_MODES, NAME_RE, isAllowedDir, CLAUDE_BIN,
 });
 
 // ---------------------------------------------------------------------------
@@ -218,8 +238,8 @@ function isPortAlreadyServed(port) {
   } catch { return false; }
 }
 
-server.listen(PORT, () => {
-  console.log(`Claude Remote Launcher listening on http://localhost:${PORT}`);
+server.listen(PORT, "127.0.0.1", () => {
+  console.log(`Claude Remote Launcher listening on http://127.0.0.1:${PORT}`);
   console.log(`Sessions limit: ${MAX_SESSIONS}`);
   console.log(`Allowed dirs: ${ALLOWED_DIRS.join(", ")}`);
   console.log(`\nEndpoints:`);
