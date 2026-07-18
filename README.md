@@ -1,5 +1,8 @@
 # Claude Remote Launcher
 
+> [!IMPORTANT]
+> **You probably don't need this anymore.** Claude Code's built-in [Remote Control](https://code.claude.com/docs/en/remote-control) now does the same thing: run `claude remote-control` (or `claude rc`) in a project directory and it stays up as a server — you can then start and drive sessions from [claude.ai/code](https://claude.ai/code) or the Claude mobile app, with multiple concurrent sessions (`--capacity`), per-session git worktrees (`--spawn worktree`), and a QR code for pairing your phone. This launcher remains useful mainly if you want one always-on endpoint that cold-starts sessions across *many* project directories from a single web UI.
+
 Launch and manage [Claude Code](https://claude.ai/code) sessions remotely from your phone, tablet, or another machine. Pick a project, tap launch, and get a link to a live Claude Code session.
 
 ## How it works
